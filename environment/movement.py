@@ -3,13 +3,21 @@ WAIT, RECHARGE = 4, 5
 ACTION_NAMES = ["up", "down", "left", "right", "wait", "recharge"]
 
 
-def legal_action_mask(drone, city, config):
+def legal_action_mask(drone, city, config, drones=None):
     if not drone.active:
         return [False, False, False, False, True, False]
 
     x, y = drone.position.x, drone.position.y
+    occupied = {
+        (other.position.x, other.position.y)
+        for other in (drones or [])
+        if other is not drone
+    }
     mask = [
-        city.inside_city(x + dx, y + dy) and not city.is_blocked(x + dx, y + dy) and drone.battery >= config["movement_battery_cost"]
+        city.inside_city(x + dx, y + dy)
+        and not city.is_blocked(x + dx, y + dy)
+        and (x + dx, y + dy) not in occupied
+        and drone.battery >= config["movement_battery_cost"]
         for dx, dy in MOVES.values()
     ]
     
@@ -22,11 +30,13 @@ def legal_action_mask(drone, city, config):
     return mask
 
 
-def execute_action(drone, action, city, config):
+def execute_action(drone, action, city, config, drones=None, action_mask=None):
     if not drone.active:
         return {"moved": False, "illegal": False, "no_fly": False}
 
-    mask = legal_action_mask(drone, city, config)
+    mask = action_mask if action_mask is not None else legal_action_mask(
+        drone, city, config, drones
+    )
     if not (0 <= action < 6) or not mask[action]:
         return {"moved": False, "illegal": True, "no_fly": False}
 

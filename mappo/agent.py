@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch.optim import Adam
 
-from .networks import Actor, CentralCritic
+from .networks import Actor, CentralCritic, MapCNNActor
 
 class MAPPOAgent:
     def __init__(
@@ -19,26 +19,40 @@ class MAPPOAgent:
         epochs=8,
         minibatch_size=256,
         device="cpu",
+        use_cnn=True,
     ):
         self.device = torch.device(device)
         self.num_agents = num_agents
+        self.obs_dim = obs_dim
+        self.action_dim = action_dim
+        self.use_cnn = use_cnn
         self.clip_eps = clip_eps
         self.entropy_coef = entropy_coef
         self.value_coef = value_coef
         self.epochs = epochs
         self.minibatch_size = minibatch_size
 
-        self.actor = Actor(obs_dim, action_dim).to(self.device)
+        actor_type = MapCNNActor if self.use_cnn else Actor
+        self.actor = actor_type(obs_dim, action_dim).to(self.device)
         self.critic = CentralCritic(state_dim, num_agents).to(self.device)
 
         self.actor_optimizer = Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_optimizer = Adam(self.critic.parameters(), lr=critic_lr)
+        self.last_action_probs = None
 
     @torch.no_grad()
-    def act(self, observations, action_masks=None, deterministic=False):
+    def act(self, observations, action_masks=None, deterministic=False, local_maps=None):
         obs = torch.as_tensor(
             observations, dtype=torch.float32, device=self.device
         )
+
+        maps = None
+        if self.use_cnn:
+            if local_maps is None:
+                raise ValueError("local_maps are required when using the CNN policy")
+            maps = torch.as_tensor(
+                local_maps, dtype=torch.float32, device=self.device
+            )
 
         mask = None
         if action_masks is not None:
@@ -46,7 +60,10 @@ class MAPPOAgent:
                 action_masks, dtype=torch.bool, device=self.device
             )
 
-        dist = self.actor.distribution(obs, mask)
+        if self.use_cnn:
+            dist = self.actor.distribution(obs, maps, mask)
+        else:
+            dist = self.actor.distribution(obs, mask)
 
         if deterministic:
             actions = torch.argmax(dist.logits, dim=-1)
@@ -55,6 +72,7 @@ class MAPPOAgent:
 
         log_probs = dist.log_prob(actions)
         entropy = dist.entropy()
+        self.last_action_probs = dist.probs.cpu().numpy()
         return (
             actions.cpu().numpy(),
             log_probs.cpu().numpy(),
@@ -77,6 +95,11 @@ class MAPPOAgent:
         returns = torch.as_tensor(batch["returns"], dtype=torch.float32, device=self.device)
         agent_ids = torch.as_tensor(batch["agent_ids"], dtype=torch.long, device=self.device)
         masks = torch.as_tensor(batch["action_masks"], dtype=torch.bool, device=self.device)
+        local_maps = None
+        if self.use_cnn:
+            local_maps = torch.as_tensor(
+                batch["local_maps"], dtype=torch.float32, device=self.device
+            )
 
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
@@ -91,7 +114,10 @@ class MAPPOAgent:
             for start in range(0, n, self.minibatch_size):
                 mb = permutation[start:start + self.minibatch_size]
 
-                dist = self.actor.distribution(obs[mb], masks[mb])
+                if self.use_cnn:
+                    dist = self.actor.distribution(obs[mb], local_maps[mb], masks[mb])
+                else:
+                    dist = self.actor.distribution(obs[mb], masks[mb])
                 new_logp = dist.log_prob(actions[mb])
                 entropy = dist.entropy().mean()
 
@@ -136,21 +162,37 @@ class MAPPOAgent:
 
     def save(self, path):
         torch.save({
+            "policy_type": "cnn" if self.use_cnn else "mlp",
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
             "actor_optimizer": self.actor_optimizer.state_dict(),
             "critic_optimizer": self.critic_optimizer.state_dict(),
         }, path)
 
-    def load(self, path, map_location=None):
+    def load(self, path, map_location=None, load_critic=True):
         checkpoint = torch.load(
             path,
             map_location=map_location or self.device,
             weights_only=False,
         )
+        policy_type = checkpoint.get("policy_type")
+        if policy_type is None:
+            policy_type = "cnn" if "map_encoder.0.weight" in checkpoint["actor"] else "mlp"
+        if policy_type not in ("cnn", "mlp"):
+            raise ValueError(f"Unsupported checkpoint policy type: {policy_type}")
+
+        checkpoint_uses_cnn = policy_type == "cnn"
+        architecture_changed = self.use_cnn != checkpoint_uses_cnn
+        if architecture_changed:
+            self.use_cnn = checkpoint_uses_cnn
+            actor_type = MapCNNActor if self.use_cnn else Actor
+            self.actor = actor_type(self.obs_dim, self.action_dim).to(self.device)
+            self.actor_optimizer = Adam(self.actor.parameters(), lr=self.actor_optimizer.param_groups[0]["lr"])
+
         self.actor.load_state_dict(checkpoint["actor"])
-        self.critic.load_state_dict(checkpoint["critic"])
-        if "actor_optimizer" in checkpoint:
+        if load_critic:
+            self.critic.load_state_dict(checkpoint["critic"])
+        if "actor_optimizer" in checkpoint and not architecture_changed:
             self.actor_optimizer.load_state_dict(checkpoint["actor_optimizer"])
-        if "critic_optimizer" in checkpoint:
+        if load_critic and "critic_optimizer" in checkpoint:
             self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])

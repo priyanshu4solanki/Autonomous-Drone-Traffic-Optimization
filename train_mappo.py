@@ -31,9 +31,12 @@ def train(args):
         entropy_coef=args.entropy_coef,
         epochs=args.epochs,
         minibatch_size=args.minibatch,
+        use_cnn=args.policy_type == "cnn",
     )
 
-    os.makedirs("checkpoints", exist_ok=True)
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    best_checkpoint = os.path.join(args.checkpoint_dir, "mappo_best.pt")
+    final_checkpoint = os.path.join(args.checkpoint_dir, "mappo.pt")
 
     best_delivery = -1.0
     best_reward = -float("inf")
@@ -41,19 +44,22 @@ def train(args):
     for episode in range(1, args.episodes + 1):
         obs, _ = env.reset(seed=args.seed + episode)
 
-        observations, states, actions, logps, rewards, dones, values, action_masks = [], [], [], [], [], [], [], []
+        observations, local_maps, states, actions, logps, rewards, dones, values, action_masks = [], [], [], [], [], [], [], [], []
         episode_reward = np.zeros(env.num_drones, dtype=np.float32)
 
         for _ in range(env.config["max_steps"]):
             state = env.get_global_state()
             masks = env.get_action_masks()
+            maps = env.get_local_maps()
 
-            action, logp, entropy = agent.act(obs, masks)
+            action, logp, entropy = agent.act(obs, masks, local_maps=maps)
             value = agent.value(state)
 
-            next_obs, reward, terminated, truncated, info = env.step(action)
+            next_obs, _, terminated, truncated, info = env.step(action)
+            reward = info["agent_rewards"]
 
             observations.append(obs.copy())
+            local_maps.append(maps.copy())
             states.append(state.copy())
             actions.append(action.copy())
             logps.append(logp.copy())
@@ -69,6 +75,7 @@ def train(args):
                 break
 
         observations = np.asarray(observations, dtype=np.float32)
+        local_maps = np.asarray(local_maps, dtype=np.float32)
         states = np.asarray(states, dtype=np.float32)
         actions = np.asarray(actions, dtype=np.int64)
         logps = np.asarray(logps, dtype=np.float32)
@@ -86,6 +93,7 @@ def train(args):
         T, N = rewards.shape
         batch = {
             "obs": observations.reshape(T * N, -1),
+            "local_maps": local_maps.reshape(T * N, *local_maps.shape[2:]),
             "states": np.repeat(states, N, axis=0),
             "actions": actions.reshape(T * N),
             "logp": logps.reshape(T * N),
@@ -106,27 +114,38 @@ def train(args):
         if delivery_rate > best_delivery or (delivery_rate == best_delivery and total_reward > best_reward):
             best_delivery = delivery_rate
             best_reward = total_reward
-            agent.save("checkpoints/mappo_best.pt")
+            agent.save(best_checkpoint)
 
         if episode == 1 or episode % args.log_every == 0:
             print(
                 f"Ep {episode:4d} | "
                 f"Reward {total_reward:9.2f} | "
                 f"Delivery {deliveries}/{N} | "
-                f"Collisions {collisions:3d} | "
+                f"Conflicts {collisions:3d} | "
                 f"NoFly {no_fly:3d} | "
                 f"Entropy {metrics['entropy']:.3f}"
             )
 
-    agent.save("checkpoints/mappo.pt")
-    print("\nSaved final model to checkpoints/mappo.pt")
-    print("Saved best model  to checkpoints/mappo_best.pt")
+    agent.save(final_checkpoint)
+    print(f"\nSaved final model to {final_checkpoint}")
+    print(f"Saved best model  to {best_checkpoint}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, default=1000)
     parser.add_argument("--drones", type=int, default=5, help="Number of drones")
     parser.add_argument("--max-steps", type=int, default=300, help="Max steps per episode")
+    parser.add_argument(
+        "--policy-type",
+        choices=("cnn", "mlp"),
+        default="cnn",
+        help="Actor architecture to train",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help="Checkpoint output directory (defaults to checkpoints/<policy-type>)",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--actor-lr", type=float, default=3e-4)
     parser.add_argument("--critic-lr", type=float, default=1e-3)
@@ -136,4 +155,7 @@ if __name__ == "__main__":
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--log-every", type=int, default=10)
-    train(parser.parse_args())
+    args = parser.parse_args()
+    if args.checkpoint_dir is None:
+        args.checkpoint_dir = os.path.join("checkpoints", args.policy_type)
+    train(args)

@@ -7,7 +7,7 @@ from .drone import Drone
 from .task_generator import TaskGenerator
 from .observations import ObservationBuilder
 from .movement import execute_action, legal_action_mask
-from .collisions import detect_collisions
+from .collisions import detect_collision_pairs
 from .rewards import RewardCalculator
 
 
@@ -39,6 +39,8 @@ class DroneTrafficEnv(gym.Env):
         self.observations = None
         self.step_count = 0
         self.total_deliveries = 0
+        self.total_collision_events = 0
+        self.total_collision_involvements = 0
         self.reward_calculator = RewardCalculator(self.config)
 
     def reset(self, *, seed=None, options=None):
@@ -53,7 +55,10 @@ class DroneTrafficEnv(gym.Env):
         )
 
         task_gen = TaskGenerator(self.city, seed=None if seed_val is None else seed_val + 1)
-        tasks = task_gen.generate_tasks(self.num_drones)
+        tasks = task_gen.generate_tasks(
+            self.num_drones,
+            tasks=None if options is None else options.get("tasks"),
+        )
 
         self.drones = [
             Drone(drone_id=i, position=src, destination=dst, battery=self.config["battery"], initial_battery=self.config["battery"])
@@ -62,6 +67,7 @@ class DroneTrafficEnv(gym.Env):
 
         self.observations = ObservationBuilder(self.city, self.drones, self.config["observation_radius"])
         self.step_count = self.total_deliveries = 0
+        self.total_collision_events = self.total_collision_involvements = 0
 
         return self.get_local_observations(), self._info()
 
@@ -69,20 +75,82 @@ class DroneTrafficEnv(gym.Env):
         actions = np.asarray(actions, dtype=np.int64).reshape(self.num_drones)
         prev_pos = [d.position for d in self.drones]
         prev_dist = [self.reward_calculator.distance(d.position, d.destination) for d in self.drones]
+        active_before_step = [d.active for d in self.drones]
+        action_masks = self.get_action_masks()
 
         events = []
-        for d, act in zip(self.drones, actions):
-            before_bat = d.battery
-            res = execute_action(d, int(act), self.city, self.config)
-            events.append((res, before_bat, int(act) == 4 and not res["illegal"]))
+        for i, (d, act) in enumerate(zip(self.drones, actions)):
+            res = execute_action(
+                d,
+                int(act),
+                self.city,
+                self.config,
+                action_mask=action_masks[i],
+            )
+            events.append((res, int(act) == 4 and not res["illegal"]))
 
         new_pos = [d.position for d in self.drones]
-        collision_flags = detect_collisions(prev_pos, new_pos, [d.active for d in self.drones])
+        collision_pairs = detect_collision_pairs(
+            prev_pos,
+            new_pos,
+            [True] * self.num_drones,
+        )
+        collision_flags = [False] * self.num_drones
+        for i, j in collision_pairs:
+            collision_flags[i] = collision_flags[j] = True
+
+        conflicting_targets = {}
+        blocked_targets = set()
+        rejected_moves = set()
+        for i, j in collision_pairs:
+            both_moving_to_same_cell = (
+                events[i][0]["moved"]
+                and events[j][0]["moved"]
+                and new_pos[i] == new_pos[j]
+            )
+            if both_moving_to_same_cell:
+                conflicting_targets.setdefault(new_pos[i], set()).update((i, j))
+            else:
+                if events[i][0]["moved"]:
+                    rejected_moves.add(i)
+                if events[j][0]["moved"]:
+                    rejected_moves.add(j)
+                if new_pos[i] == new_pos[j]:
+                    blocked_targets.add(new_pos[i])
+
+        for target, contenders in conflicting_targets.items():
+            if target in blocked_targets:
+                rejected_moves.update(contenders)
+                continue
+            winner = min(
+                contenders,
+                key=lambda index: (self.drones[index].drone_id - self.step_count) % self.num_drones,
+            )
+            rejected_moves.update(contenders - {winner})
+
+        # Cancel rejected moves and restore the battery they would have used.
+        for i in rejected_moves:
+            drone = self.drones[i]
+            candidate = drone.position
+            drone.position = prev_pos[i]
+            drone.distance_travelled -= self.reward_calculator.distance(prev_pos[i], candidate)
+            drone.trajectory.pop()
+            drone.battery = min(
+                drone.initial_battery,
+                drone.battery + self.config["movement_battery_cost"],
+            )
+
+        collision_flags = [i in rejected_moves for i in range(self.num_drones)]
+        self.total_collision_events += len(collision_pairs)
+        self.total_collision_involvements += sum(
+            collided and active_before_step[i]
+            for i, collided in enumerate(collision_flags)
+        )
         rewards = np.zeros(self.num_drones, dtype=np.float32)
 
         for i, d in enumerate(self.drones):
-            res, _, waited = events[i]
-            if collision_flags[i]: d.collisions += 1
+            res, waited = events[i]
+            if collision_flags[i] and active_before_step[i]: d.collisions += 1
 
             delivered_now = False
             if d.active and d.position == d.destination:
@@ -93,7 +161,9 @@ class DroneTrafficEnv(gym.Env):
             if battery_failure: d.active = False
 
             rewards[i] = self.reward_calculator.calculate(
-                d, prev_dist[i], collision=collision_flags[i], illegal=res["illegal"],
+                d, prev_dist[i],
+                collision=collision_flags[i] and active_before_step[i],
+                illegal=res["illegal"],
                 battery_failure=battery_failure, delivered_now=delivered_now, waited=waited
             )
             d.steps_taken += 1
@@ -106,23 +176,37 @@ class DroneTrafficEnv(gym.Env):
         info.update({
             "deliveries": self.total_deliveries,
             "battery_remaining": float(np.mean([d.battery for d in self.drones])),
+            "agent_rewards": rewards.copy(),
         })
 
-        return self.get_local_observations(), rewards, terminated, truncated, info
+        return (
+            self.get_local_observations(),
+            float(np.sum(rewards)),
+            terminated,
+            truncated,
+            info,
+        )
 
     def get_local_observations(self):
         return self.observations.all_local()
+
+    def get_local_maps(self):
+        return self.observations.all_local_maps()
 
     def get_global_state(self):
         return self.observations.global_state()
 
     def get_action_masks(self):
-        return np.asarray([legal_action_mask(d, self.city, self.config) for d in self.drones], dtype=bool)
+        return np.asarray([
+            legal_action_mask(d, self.city, self.config, self.drones)
+            for d in self.drones
+        ], dtype=bool)
 
     def _info(self):
         return {
             "deliveries": self.total_deliveries,
-            "collisions": sum(d.collisions for d in self.drones),
+            "collisions": self.total_collision_events,
+            "collision_involvements": self.total_collision_involvements,
             "no_fly_violations": sum(d.no_fly_violations for d in self.drones),
         }
 

@@ -3,6 +3,15 @@ import numpy as np
 
 
 class ObservationBuilder:
+    MAP_CHANNELS = (
+        "buildings",
+        "no_fly_zones",
+        "charging_stations",
+        "other_drones",
+        "self",
+        "destination",
+    )
+
     def __init__(self, city, drones, observation_radius=4):
         self.city, self.drones, self.radius = city, drones, observation_radius
 
@@ -27,7 +36,7 @@ class ObservationBuilder:
             float(self._drone_at(x, y - 1, drone)),
             float(self._drone_at(x - 1, y, drone)),
             float(self._drone_at(x + 1, y, drone)),
-            ndist / max(self.radius, 1),
+            float(np.clip(ndist / max(self.radius, 1), 0.0, 1.0)),
             self._relative(ndx),
             self._relative(ndy),
             self._traffic_density(drone),
@@ -39,6 +48,32 @@ class ObservationBuilder:
 
     def all_local(self):
         return np.asarray([self.local_observation(d) for d in self.drones], dtype=np.float32)
+
+    def local_map(self, drone):
+        size = 2 * self.radius + 1
+        local_map = np.zeros((len(self.MAP_CHANNELS), size, size), dtype=np.float32)
+        center_x, center_y = drone.position.x, drone.position.y
+
+        for row, dy in enumerate(range(-self.radius, self.radius + 1)):
+            for col, dx in enumerate(range(-self.radius, self.radius + 1)):
+                x, y = center_x + dx, center_y + dy
+                if not self.city.inside_city(x, y):
+                    local_map[0, row, col] = 1.0
+                    continue
+
+                local_map[0, row, col] = float(self.city.is_building(x, y))
+                local_map[1, row, col] = float(self.city.is_no_fly_zone(x, y))
+                local_map[2, row, col] = float(self.city.is_charging_station(x, y))
+                local_map[3, row, col] = float(self._drone_at(x, y, drone))
+                local_map[4, row, col] = float(x == center_x and y == center_y)
+                local_map[5, row, col] = float(
+                    x == drone.destination.x and y == drone.destination.y
+                )
+
+        return local_map
+
+    def all_local_maps(self):
+        return np.asarray([self.local_map(d) for d in self.drones], dtype=np.float32)
 
     def global_state(self):
         state = [
@@ -73,7 +108,10 @@ class ObservationBuilder:
         return min(distances, key=lambda item: item[2])
 
     def _drone_at(self, x, y, drone):
-        return any(d is not drone and d.active and d.position.x == x and d.position.y == y for d in self.drones)
+        return any(
+            d is not drone and d.position.x == x and d.position.y == y
+            for d in self.drones
+        )
 
     def _traffic_density(self, drone):
         active_others = [d for d in self.drones if d is not drone and d.active]

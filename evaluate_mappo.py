@@ -1,10 +1,78 @@
 import argparse
+import os
 import numpy as np
 import torch
 
 from environment.drone_env import DroneTrafficEnv
+from environment.obstacles import Point
 from environment.renderer import Renderer
 from mappo.agent import MAPPOAgent
+from mappo.route_guidance import choose_guided_actions
+
+
+def prompt_integer(label, default, minimum, maximum):
+    while True:
+        response = input(f"{label} [{default}]: ").strip()
+        if not response:
+            return default
+        try:
+            value = int(response)
+        except ValueError:
+            print("Enter a whole number.")
+            continue
+        if minimum <= value <= maximum:
+            return value
+        print(f"Choose a value from {minimum} to {maximum}.")
+
+
+def show_locations(title, locations):
+    print(f"\n{title}")
+    for index, point in enumerate(locations, start=1):
+        print(f"  {index:2}: ({point.x:2}, {point.y:2})", end="")
+        if index % 5 == 0:
+            print()
+    if len(locations) % 5:
+        print()
+
+
+def prompt_missions(env):
+    warehouses = env.city.warehouses
+    delivery_points = env.city.delivery_points
+    show_locations("Choose a warehouse number for each drone:", warehouses)
+    show_locations("Choose a delivery-point number for each drone:", delivery_points)
+    print("\nChoose distinct warehouse and delivery-point numbers for each drone.")
+
+    missions = []
+    used_sources = set()
+    used_destinations = set()
+    for drone_id in range(env.num_drones):
+        while True:
+            response = input(
+                f"Drone {drone_id + 1} mission (warehouse, delivery point), "
+                "for example 2,7: "
+            ).strip()
+            try:
+                source_id, destination_id = (
+                    int(value.strip()) for value in response.split(",")
+                )
+                source = warehouses[source_id - 1]
+                destination = delivery_points[destination_id - 1]
+            except (ValueError, IndexError):
+                print("Enter two valid menu numbers separated by a comma.")
+                continue
+
+            if source in used_sources:
+                print("That warehouse is already assigned; choose another.")
+                continue
+            if destination in used_destinations:
+                print("That delivery point is already assigned; choose another.")
+                continue
+
+            missions.append((Point(source.x, source.y), Point(destination.x, destination.y)))
+            used_sources.add(source)
+            used_destinations.add(destination)
+            break
+    return missions
 
 
 def evaluate(args):
@@ -26,6 +94,17 @@ def evaluate(args):
     # inside env.reset().
 
     observations, info = env.reset(seed=args.seed)
+    custom_tasks = None
+    if args.interactive:
+        print("\nMAP LEGEND: B building | X no-fly zone | W warehouse")
+        print("            D delivery point | C charging station")
+        response = input("\nChoose custom warehouse/delivery points? [Y/n]: ").strip().lower()
+        if response not in ("n", "no"):
+            custom_tasks = prompt_missions(env)
+            observations, info = env.reset(
+                seed=args.seed,
+                options={"tasks": custom_tasks},
+            )
 
     # ============================================================
     # CREATE MAPPO AGENT
@@ -45,7 +124,7 @@ def evaluate(args):
     # LOAD TRAINED MODEL
     # ============================================================
 
-    agent.load(args.model, map_location=args.device)
+    agent.load(args.model, map_location=args.device, load_critic=False)
 
     print()
     print("=" * 60)
@@ -57,6 +136,9 @@ def evaluate(args):
     print(f"Max steps:      {args.max_steps}")
     print(f"Device:         {args.device}")
     print(f"Deterministic:  {args.deterministic}")
+    print(
+        f"Action selection: {'CNN with A* route guidance' if args.route_guidance else 'CNN/MLP policy'}"
+    )
     print("=" * 60)
     print()
 
@@ -72,6 +154,10 @@ def evaluate(args):
             cell_size=args.cell_size,
             sidebar_width=args.sidebar_width,
             fps=args.fps,
+            policy_type=(
+                ("CNN" if agent.use_cnn else "MLP")
+                + (" + route guidance" if args.route_guidance else "")
+            ),
         )
 
     # ============================================================
@@ -81,6 +167,7 @@ def evaluate(args):
     episode_rewards = []
     episode_deliveries = []
     episode_collisions = []
+    episode_collision_involvements = []
     episode_no_fly = []
     episode_battery = []
     episode_steps = []
@@ -93,7 +180,8 @@ def evaluate(args):
 
         # Reset environment
         observations, info = env.reset(
-            seed=args.seed + episode - 1
+            seed=args.seed + episode - 1,
+            options={"tasks": custom_tasks} if custom_tasks is not None else None,
         )
 
         # Reset renderer for new episode
@@ -121,6 +209,7 @@ def evaluate(args):
             # ----------------------------------------------------
 
             action_masks = env.get_action_masks()
+            local_maps = env.get_local_maps()
 
             # ----------------------------------------------------
             # Select actions using decentralized actors
@@ -128,7 +217,7 @@ def evaluate(args):
             # IMPORTANT:
             # MAPPOAgent uses:
             #
-            #     local observation -> actor -> action
+            #     local observation + map crop -> shared actor -> action
             #
             # The global state is NOT passed to act().
             #
@@ -140,13 +229,32 @@ def evaluate(args):
                 observations,
                 action_masks=action_masks,
                 deterministic=args.deterministic,
+                local_maps=local_maps,
             )
+            if args.route_guidance:
+                actions = choose_guided_actions(
+                    env,
+                    agent.last_action_probs,
+                    action_masks,
+                )
 
             # ----------------------------------------------------
+            # Render the current CNN input and selected actions before moving.
+            if renderer is not None:
+                can_advance = renderer.render(
+                    actions=actions,
+                    action_probabilities=agent.last_action_probs,
+                )
+                if not can_advance:
+                    if not renderer.running:
+                        done = True
+                        break
+                    continue
+
             # Execute actions
             # ----------------------------------------------------
 
-            next_observations, rewards, terminated, truncated, info = env.step(
+            next_observations, _, terminated, truncated, info = env.step(
                 actions
             )
 
@@ -154,16 +262,9 @@ def evaluate(args):
             # Accumulate rewards
             # ----------------------------------------------------
 
-            episode_reward += rewards
+            episode_reward += info["agent_rewards"]
 
             steps += 1
-
-            # ----------------------------------------------------
-            # Render current state
-            # ----------------------------------------------------
-
-            if renderer is not None:
-                renderer.render()
 
             # ----------------------------------------------------
             # Check episode termination
@@ -204,6 +305,7 @@ def evaluate(args):
         episode_rewards.append(total_reward)
         episode_deliveries.append(deliveries)
         episode_collisions.append(collisions)
+        episode_collision_involvements.append(info.get("collision_involvements", 0))
         episode_no_fly.append(no_fly)
         episode_battery.append(battery)
         episode_steps.append(steps)
@@ -216,11 +318,22 @@ def evaluate(args):
             f"Episode {episode:4d} | "
             f"Reward: {total_reward:9.2f} | "
             f"Deliveries: {deliveries}/{args.drones} | "
-            f"Collisions: {collisions:3d} | "
+            f"Conflicts: {collisions:3d} | "
             f"No-fly: {no_fly:3d} | "
             f"Battery: {battery:6.2f} | "
             f"Steps: {steps:4d}"
         )
+
+        if renderer is not None and renderer.running:
+            renderer.render()
+
+        if args.interactive and renderer is not None:
+            renderer.show_results(
+                deliveries=deliveries,
+                total=args.drones,
+                conflicts=collisions,
+                steps=steps,
+            )
 
     # ============================================================
     # FINAL STATISTICS
@@ -241,6 +354,9 @@ def evaluate(args):
 
     avg_collisions = float(
         np.mean(episode_collisions)
+    )
+    avg_collision_involvements = float(
+        np.mean(episode_collision_involvements)
     )
 
     avg_no_fly = float(
@@ -274,8 +390,10 @@ def evaluate(args):
     )
 
     print(
-        f"Collisions/episode:  {avg_collisions:.3f}"
+        f"Prevented conflicts/episode: {avg_collisions:.3f}"
     )
+
+    print(f"Drone conflict involvements: {avg_collision_involvements:.3f}")
 
     print(
         f"No-fly/episode:      {avg_no_fly:.3f}"
@@ -306,7 +424,7 @@ def evaluate(args):
     env.close()
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Evaluate a trained MAPPO drone traffic model."
     )
@@ -318,8 +436,13 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        required=True,
+        default="checkpoints/cnn/mappo_best.pt",
         help="Path to trained MAPPO checkpoint.",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Prompt for fleet size and missions, then launch a visual demo.",
     )
 
     # ------------------------------------------------------------
@@ -363,6 +486,11 @@ def main():
         action="store_true",
         help="Use deterministic action selection.",
     )
+    parser.add_argument(
+        "--route-guidance",
+        action="store_true",
+        help="Constrain CNN choices to shortest safe routes using the simulator map.",
+    )
 
     parser.add_argument(
         "--device",
@@ -384,25 +512,52 @@ def main():
     parser.add_argument(
         "--fps",
         type=int,
-        default=10,
+        default=3,
         help="Rendering FPS.",
     )
 
     parser.add_argument(
         "--cell_size",
         type=int,
-        default=40,
+        default=28,
         help="Pixel size of each city grid cell.",
     )
 
     parser.add_argument(
         "--sidebar_width",
         type=int,
-        default=300,
+        default=440,
         help="Width of the renderer sidebar.",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    if args.interactive:
+        print("=" * 62)
+        print("AUTONOMOUS DRONE DELIVERY — INTERACTIVE SIMULATION")
+        print("=" * 62)
+        print("Simulation only; this does not control real drone hardware.")
+        args.drones = prompt_integer("How many delivery drones?", 5, 1, 10)
+        args.episodes = 1
+        args.max_steps = prompt_integer("Maximum simulation steps?", 300, 20, 2000)
+        args.seed = prompt_integer(
+            "City seed (same seed reproduces the city)?", 42, 0, 2**31 - 1
+        )
+        args.fps = prompt_integer("Playback speed in frames per second?", 3, 1, 20)
+        response = input(
+            "Enable A* route guidance for the recommended demo? [Y/n]: "
+        ).strip().lower()
+        args.route_guidance = response not in ("n", "no")
+        args.render = True
+        args.deterministic = True
+        print(f"\nLoading model: {args.model}")
+        print("Controls: SPACE pause/resume, N single-step, +/- speed, ESC exit.")
+
+    if not os.path.isfile(args.model):
+        raise FileNotFoundError(
+            f"Model checkpoint not found: {args.model}. "
+            "Train one with `python train_mappo.py` or pass --model."
+        )
 
     # ------------------------------------------------------------
     # Validate arguments
